@@ -23,6 +23,7 @@ model User {
 
 model Document {
   id     String @id @default(uuid())
+  name String
   state  Bytes?
   userId String
   user   User   @relation(fields: [userId], references: [id])
