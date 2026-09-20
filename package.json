@@ -4,6 +4,9 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
+    "dev:web": "bun run --filter web dev",
+    "dev:api": "bun run apps/apiServer/src/index.ts",
+    "dev:ws": "bun run apps/wsServer/index.ts",
     "lint": "turbo run lint",
     "format": "prettier --write \"**/*.{ts,tsx,md}\"",
     "check-types": "turbo run check-types"

@@ -1,159 +1,53 @@
-# Turborepo starter
+# Realtime Collaborative Text Editor
 
-This Turborepo starter is maintained by the Turborepo core team.
+Bun + Turborepo monorepo with a REST API, WebSocket/Yjs sync server, and TanStack Start frontend.
 
-## Using this example
+## Apps
 
-Run the following command:
+| App | Path | Role |
+|-----|------|------|
+| `web` | [`apps/web`](apps/web) | TanStack Start UI (auth, documents, Quill + Yjs editor) |
+| `apiServer` | [`apps/apiServer`](apps/apiServer) | Express REST API (`/api/v1`) |
+| `wsServer` | [`apps/wsServer`](apps/wsServer) | WebSocket server for live Yjs updates |
 
-```sh
-npx create-turbo@latest
+## Packages
+
+- `@repo/database` — Prisma + PostgreSQL
+- `@repo/ui` — stub React library (unused by web; shadcn lives in `apps/web`)
+- `@repo/eslint-config` / `@repo/typescript-config` — shared tooling
+
+## Quick start
+
+```bash
+bun install
 ```
 
-## What's inside?
+### Backend
 
-This Turborepo includes the following packages/apps:
+1. Ensure Postgres and Redis are running.
+2. Configure `apps/apiServer` env (`PORT=3000`, `JWT_SECRET=SECRET`, `DATABASE_URL=...`).
+   - Use `JWT_SECRET=SECRET` so WS auth matches the hardcoded secret in `wsServer`.
+3. Start services:
 
-### Apps and Packages
-
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `@next/eslint-plugin-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
-
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
-
-### Utilities
-
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo build
+```bash
+bun run dev:api   # REST API → http://localhost:3000
+bun run dev:ws    # WebSocket → ws://localhost:8080
 ```
 
-Without global `turbo`, use your package manager:
+### Frontend
 
-```sh
-cd my-turborepo
-npx turbo build
-bun exec turbo build
-bun exec turbo build
+```bash
+cp apps/web/.env.example apps/web/.env
+bun run dev:web   # → http://localhost:5173
 ```
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+See [`apps/web/README.md`](apps/web/README.md) for frontend details.
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
+## Scripts
 
-```sh
-turbo build --filter=docs
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo build --filter=docs
-bun exec turbo build --filter=docs
-bun exec turbo build --filter=docs
-```
-
-### Develop
-
-To develop all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo dev
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo dev
-bun exec turbo dev
-bun exec turbo dev
-```
-
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo dev --filter=web
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo dev --filter=web
-bun exec turbo dev --filter=web
-bun exec turbo dev --filter=web
-```
-
-### Remote Caching
-
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo login
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo login
-bun exec turbo login
-bun exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-bun exec turbo link
-bun exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+| Script | Description |
+|--------|-------------|
+| `bun run dev:web` | Start TanStack Start app |
+| `bun run dev:api` | Start API server |
+| `bun run dev:ws` | Start WebSocket server |
+| `bun run build` | Build all packages via Turbo |
