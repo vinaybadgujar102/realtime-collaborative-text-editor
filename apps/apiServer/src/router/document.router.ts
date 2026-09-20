@@ -47,11 +47,23 @@ documentRouter.get("/:id", async (req: Request, res: Response) => {
     }
 
     if (documents.state) {
-      await redis.set(`doc:${documents.id}:content`, documents.state);
+      console.log("added state");
+      // Cache with 1h TTL — WS refresh/extend this while the doc is active.
+      await redis.set(
+        `doc:${documents.id}:state`,
+        documents.state,
+        "EX",
+        60 * 60,
+      );
     }
 
+    // Prisma Bytes is Uint8Array; JSON.stringify(Uint8Array) becomes {"0":n,...}.
+    // Buffer serializes as { type: "Buffer", data: number[] } for the client.
     return successResponse(res, StatusCodes.OK, "Docs created successfully!", {
-      documents,
+      documents: {
+        ...documents,
+        state: documents.state ? Buffer.from(documents.state) : null,
+      },
     });
   } catch (error) {
     throw new Error("Internal Server Error");
