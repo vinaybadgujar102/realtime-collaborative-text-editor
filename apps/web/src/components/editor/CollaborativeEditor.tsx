@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { decodeDocumentState } from '#/lib/document-state'
+import { getUserIdFromToken } from '#/lib/auth'
 import type { DocumentDetail } from '#/lib/types'
 import { Badge } from '#/components/ui/badge'
 import { Skeleton } from '#/components/ui/skeleton'
@@ -14,6 +15,15 @@ type ConnectionStatus =
   | 'disconnected'
   | 'error'
 
+const LIVE_COLORS = [
+  'bg-emerald-500',
+  'bg-sky-500',
+  'bg-amber-500',
+  'bg-rose-500',
+  'bg-violet-500',
+  'bg-cyan-500',
+]
+
 function statusVariant(
   status: ConnectionStatus,
 ): 'default' | 'secondary' | 'destructive' | 'outline' {
@@ -27,6 +37,10 @@ function statusVariant(
     default:
       return 'outline'
   }
+}
+
+function shortId(userId: string) {
+  return userId.slice(0, 2).toUpperCase()
 }
 
 const quillModules = {
@@ -68,6 +82,8 @@ export function CollaborativeEditor({ document }: CollaborativeEditorProps) {
 function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
+  const [liveUserIds, setLiveUserIds] = useState<string[]>([])
+  const selfId = getUserIdFromToken()
 
   useEffect(() => {
     let cancelled = false
@@ -113,6 +129,7 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
         doc: yDoc,
         documentId: document.id,
         onStatusChange: setStatus,
+        onPresenceChange: setLiveUserIds,
       })
 
       cleanup = () => {
@@ -141,9 +158,41 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
             Collaborative editor powered by Quill and Yjs
           </p>
         </div>
-        <Badge variant={statusVariant(status)} className="capitalize">
-          {status}
-        </Badge>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <span className="relative flex size-2">
+              <span
+                className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-60 ${
+                  liveUserIds.length > 0 ? 'bg-emerald-400' : 'bg-muted-foreground'
+                }`}
+              />
+              <span
+                className={`relative inline-flex size-2 rounded-full ${
+                  liveUserIds.length > 0 ? 'bg-emerald-500' : 'bg-muted-foreground'
+                }`}
+              />
+            </span>
+            <span className="text-sm text-muted-foreground">
+              {liveUserIds.length} live
+            </span>
+            <div className="flex -space-x-1.5">
+              {liveUserIds.map((userId, index) => (
+                <div
+                  key={userId}
+                  title={userId === selfId ? 'You' : userId}
+                  className={`flex size-7 items-center justify-center rounded-full border-2 border-background text-[10px] font-semibold text-white ${
+                    LIVE_COLORS[index % LIVE_COLORS.length]
+                  }`}
+                >
+                  {shortId(userId)}
+                </div>
+              ))}
+            </div>
+          </div>
+          <Badge variant={statusVariant(status)} className="capitalize">
+            {status}
+          </Badge>
+        </div>
       </div>
 
       <div

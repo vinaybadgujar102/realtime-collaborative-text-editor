@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import { FileText, LogOut } from 'lucide-react'
 import { clearToken, isAuthenticated } from '#/lib/auth'
@@ -5,13 +6,16 @@ import { Button } from '#/components/ui/button'
 
 export function AppHeader() {
   const navigate = useNavigate()
-  // Re-read auth when the route changes (login/logout/navigation).
-  useRouterState({ select: (s) => s.location.pathname })
-  const authenticated =
-    typeof window !== 'undefined' ? isAuthenticated() : false
+  const pathname = useRouterState({ select: (s) => s.location.pathname })
+  const [authenticated, setAuthenticated] = useState(false)
+
+  useEffect(() => {
+    setAuthenticated(isAuthenticated())
+  }, [pathname])
 
   function handleLogout() {
     clearToken()
+    setAuthenticated(false)
     void navigate({ to: '/login' })
   }
 

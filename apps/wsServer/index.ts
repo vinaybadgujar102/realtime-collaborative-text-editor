@@ -23,6 +23,23 @@ function redisStateKey(docId: string) {
   return `doc:${docId}:state`;
 }
 
+/** Redis Set of live user IDs for a document. */
+function redisPresenceKey(docId: string) {
+  return `presence:doc:${docId}`;
+}
+
+async function addLiveUser(docId: string, userId: string) {
+  await redis.sadd(redisPresenceKey(docId), userId);
+}
+
+async function removeLiveUser(docId: string, userId: string) {
+  await redis.srem(redisPresenceKey(docId), userId);
+}
+
+async function getLiveUserIds(docId: string): Promise<string[]> {
+  return redis.smembers(redisPresenceKey(docId));
+}
+
 async function setRedisState(docId: string, state: Buffer | Uint8Array) {
   await redis.set(redisStateKey(docId), state, "EX", REDIS_TTL_SECONDS);
 }
@@ -67,6 +84,7 @@ async function cleanupRedisAfterLeave(docId: string) {
 
     await flushDocRedisToPostgres(docId);
     await redis.del(redisStateKey(docId));
+    await redis.del(redisPresenceKey(docId));
 
     activeDocs.delete(docId);
     dirtyDocs.delete(docId);
@@ -151,10 +169,12 @@ function leaveRoom(docId: string | undefined, ws: WebSocket) {
   }
 }
 
-function broadcastToRoom(docId: string, sender: WebSocket, update: Uint8Array) {
+function broadcastBinaryToRoom(
+  docId: string,
+  sender: WebSocket,
+  update: Uint8Array,
+) {
   const room = rooms.get(docId);
-
-  console.log(room);
   if (!room) return;
 
   for (const client of room) {
@@ -163,19 +183,32 @@ function broadcastToRoom(docId: string, sender: WebSocket, update: Uint8Array) {
     }
   }
 }
-type updateMessage = {
-  id: string;
-  type: string;
-  payload: {
-    userId: string;
-    docId: string;
-    data: Uint8Array;
-  };
-};
+
+function broadcastJsonToRoom(
+  docId: string,
+  message: unknown,
+  exclude?: WebSocket,
+) {
+  const room = rooms.get(docId);
+  if (!room) return;
+
+  const payload = JSON.stringify(message);
+  for (const client of room) {
+    if (client === exclude) continue;
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+function getSocketUserId(ws: WebSocket): string | undefined {
+  return (ws as WebSocket & { user?: { id?: string } }).user?.id;
+}
 
 function verifyToken(token) {
   return jwt.verify(token, "SECRET");
 }
+
 const server = createServer();
 const wss = new WebSocketServer({ noServer: true });
 
@@ -183,51 +216,99 @@ wss.on("connection", (ws: WebSocket) => {
   console.log("client connected");
 
   const docId = ws.docId as string | undefined;
-  console.log(docId);
+  const userId = getSocketUserId(ws);
 
-  if (docId) {
+  void (async () => {
+    if (!docId || !userId) return;
+
     joinRoom(docId, ws);
-  }
+    await addLiveUser(docId, userId);
+
+    // Sync current Redis live set to the new client.
+    const userIds = await getLiveUserIds(docId);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "presence",
+          event: "sync",
+          userIds,
+        }),
+      );
+    }
+
+    broadcastJsonToRoom(docId, { type: "presence", event: "join", userId }, ws);
+  })().catch((error) => {
+    console.error("failed to register live presence", error);
+  });
 
   ws.on("close", () => {
-    leaveRoom(docId, ws);
+    void (async () => {
+      if (docId && userId) {
+        await removeLiveUser(docId, userId);
+        broadcastJsonToRoom(docId, {
+          type: "presence",
+          event: "leave",
+          userId,
+        });
+      }
+      leaveRoom(docId, ws);
+    })().catch((error) => {
+      console.error("failed to clear live presence on close", error);
+      leaveRoom(docId, ws);
+    });
   });
 
   ws.on("message", async (data) => {
-    const parsedData = JSON.parse(data) as {
-      id: string;
-      type: "update_doc";
-      payload: {
-        data: Uint8Array;
-        docId: string;
-        userId: string;
+    let parsedData: {
+      id?: string;
+      type: string;
+      payload?: {
+        data?: number[];
+        docId?: string;
+        userId?: string;
       };
     };
 
+    try {
+      parsedData = JSON.parse(String(data));
+    } catch {
+      return;
+    }
+
+    // Heartbeat — re-add to presence set (idempotent).
+    if (parsedData.type === "ping") {
+      const pingDocId = parsedData.payload?.docId ?? docId;
+      const pingUserId = parsedData.payload?.userId ?? userId;
+      if (!pingDocId || !pingUserId) return;
+
+      await addLiveUser(pingDocId, pingUserId);
+      return;
+    }
+
     if (parsedData.type === "update_doc") {
       console.log("updating doc");
-      const docId = parsedData.payload.docId;
+      const msgDocId = parsedData.payload?.docId;
+      if (!msgDocId || !parsedData.payload?.data) return;
+
       // check if the doc is active in here
-      let doc = activeDocs.get(docId);
+      let doc = activeDocs.get(msgDocId);
       if (!doc) {
         doc = new Y.Doc();
-        const redisDoc = await redis.getBuffer(redisStateKey(docId));
+        const redisDoc = await redis.getBuffer(redisStateKey(msgDocId));
         // getBuffer returns null when the key is missing — never apply null to Yjs
         if (redisDoc != null && redisDoc.byteLength > 0) {
           Y.applyUpdate(doc, new Uint8Array(redisDoc));
         }
-        activeDocs.set(docId, doc);
+        activeDocs.set(msgDocId, doc);
       }
 
       // Client sends data as number[] over JSON — convert to Uint8Array
-      const updateBytes = Uint8Array.from(
-        parsedData.payload.data as unknown as number[],
-      );
+      const updateBytes = Uint8Array.from(parsedData.payload.data);
       if (updateBytes.byteLength === 0) return;
 
       Y.applyUpdate(doc, updateBytes);
-      markDirty(docId);
-      broadcastToRoom(docId, ws, updateBytes);
+      markDirty(msgDocId);
+      broadcastBinaryToRoom(msgDocId, ws, updateBytes);
     }
   });
 });
