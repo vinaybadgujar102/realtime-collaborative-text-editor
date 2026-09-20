@@ -79,6 +79,7 @@
     "apps/wsServer": {
       "name": "wsserver",
       "dependencies": {
+        "@repo/database": "workspace:*",
         "yjs": "^13.6.32",
       },
       "devDependencies": {
