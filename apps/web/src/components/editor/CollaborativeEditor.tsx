@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { decodeDocumentState } from '#/lib/document-state'
 import type { DocumentDetail } from '#/lib/types'
 import { Badge } from '#/components/ui/badge'
 import { Skeleton } from '#/components/ui/skeleton'
@@ -26,16 +27,6 @@ function statusVariant(
     default:
       return 'outline'
   }
-}
-
-function decodeDocumentState(
-  state: DocumentDetail['state'],
-): Uint8Array | null {
-  if (!state) return null
-  if (Array.isArray(state.data)) {
-    return new Uint8Array(state.data)
-  }
-  return null
 }
 
 const quillModules = {
@@ -104,12 +95,13 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
       containerRef.current.appendChild(editorEl)
 
       const yDoc = new Y.Doc()
+      const yText = yDoc.getText('quill')
+
       const bytes = decodeDocumentState(document.state)
       if (bytes) {
         Y.applyUpdate(yDoc, bytes)
       }
 
-      const yText = yDoc.getText('quill')
       const quill = new Quill(editorEl, {
         theme: 'snow',
         modules: quillModules,
