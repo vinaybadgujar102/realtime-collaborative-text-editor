@@ -1,10 +1,17 @@
 import * as Y from 'yjs'
 import { getToken, getUserIdFromToken } from '#/lib/auth'
+import {
+  clearPendingUpdates,
+  loadDocumentCache,
+  savePendingUpdates,
+} from '#/lib/offline/document-cache'
 
 export type ConnectionStatus =
   | 'connecting'
   | 'connected'
   | 'disconnected'
+  | 'offline'
+  | 'syncing'
   | 'error'
 
 export type PresenceEvent =
@@ -15,6 +22,8 @@ export type PresenceEvent =
 const DEFAULT_DEBOUNCE_MS = 300
 /** Must be frequent enough to keep presence healthy while connected. */
 const PING_INTERVAL_MS = 5_000
+const MAX_RECONNECT_DELAY_MS = 30_000
+const INITIAL_RECONNECT_DELAY_MS = 1_000
 
 type YjsProviderOptions = {
   doc: Y.Doc
@@ -33,6 +42,11 @@ type YjsProviderOptions = {
  * - Client → server: JSON { type: "ping", payload: { userId, docId } } (keeps presence set membership)
  * - Server → client: raw binary Yjs update frames
  * - Presence: JSON { type: "presence", event: "join"|"leave"|"sync", ... }
+ *
+ * Offline support:
+ * - Persists pending updates to localStorage when disconnected
+ * - Auto-reconnects with exponential backoff when back online
+ * - Flushes pending updates on reconnect
  */
 export class YjsWebsocketProvider {
   private ws: WebSocket | null = null
@@ -47,13 +61,22 @@ export class YjsWebsocketProvider {
   private pendingUpdates: Uint8Array[] = []
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectAttempts = 0
   private liveUserIds = new Set<string>()
+  private isBrowserOnline = typeof navigator !== 'undefined' ? navigator.onLine : true
 
   private handleUpdate = (update: Uint8Array, origin: unknown) => {
     if (this.destroyed || origin === this || this.applyingRemote) return
 
     this.pendingUpdates.push(update)
+    this.persistPendingUpdates()
     this.scheduleFlush()
+  }
+
+  private persistPendingUpdates() {
+    if (this.pendingUpdates.length === 0) return
+    savePendingUpdates(this.documentId, this.pendingUpdates)
   }
 
   private scheduleFlush = () => {
@@ -69,7 +92,10 @@ export class YjsWebsocketProvider {
 
   private flushPendingUpdates = () => {
     if (this.destroyed || this.pendingUpdates.length === 0) return
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.persistPendingUpdates()
+      return
+    }
 
     const merged =
       this.pendingUpdates.length === 1
@@ -89,7 +115,10 @@ export class YjsWebsocketProvider {
       },
     }
 
+    this.setStatus('syncing')
     this.ws.send(JSON.stringify(message))
+    clearPendingUpdates(this.documentId)
+    this.setStatus('connected')
   }
 
   private sendPing = () => {
@@ -122,6 +151,54 @@ export class YjsWebsocketProvider {
     }
   }
 
+  private clearReconnectTimer() {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.destroyed || !this.isBrowserOnline) return
+    if (this.reconnectTimer !== null) return
+
+    const delay = Math.min(
+      INITIAL_RECONNECT_DELAY_MS * 2 ** this.reconnectAttempts,
+      MAX_RECONNECT_DELAY_MS,
+    )
+
+    this.reconnectAttempts++
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, delay)
+  }
+
+  private handleBrowserOnline = () => {
+    this.isBrowserOnline = true
+    this.reconnectAttempts = 0
+    this.clearReconnectTimer()
+    this.connect()
+  }
+
+  private handleBrowserOffline = () => {
+    this.isBrowserOnline = false
+    this.clearReconnectTimer()
+    this.persistPendingUpdates()
+
+    if (this.ws) {
+      this.ws.onopen = null
+      this.ws.onmessage = null
+      this.ws.onerror = null
+      this.ws.onclose = null
+      this.ws.close()
+      this.ws = null
+    }
+
+    this.stopPingLoop()
+    this.setStatus('offline')
+  }
+
   constructor(options: YjsProviderOptions) {
     this.doc = options.doc
     this.documentId = options.documentId
@@ -130,6 +207,13 @@ export class YjsWebsocketProvider {
     this.onStatusChange = options.onStatusChange
     this.onPresenceChange = options.onPresenceChange
 
+    const cached = loadDocumentCache(this.documentId)
+    if (cached?.pendingUpdates.length) {
+      this.pendingUpdates = cached.pendingUpdates.map((data) =>
+        Uint8Array.from(data),
+      )
+    }
+
     const selfId = getUserIdFromToken()
     if (selfId) {
       this.liveUserIds.add(selfId)
@@ -137,7 +221,17 @@ export class YjsWebsocketProvider {
     }
 
     this.doc.on('update', this.handleUpdate)
-    this.connect()
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', this.handleBrowserOnline)
+      window.addEventListener('offline', this.handleBrowserOffline)
+    }
+
+    if (this.isBrowserOnline) {
+      this.connect()
+    } else {
+      this.setStatus('offline')
+    }
   }
 
   private setStatus(status: ConnectionStatus) {
@@ -170,13 +264,15 @@ export class YjsWebsocketProvider {
   }
 
   private connect() {
-    if (this.destroyed) return
+    if (this.destroyed || !this.isBrowserOnline) return
 
     const token = getToken()
     if (!token) {
       this.setStatus('error')
       return
     }
+
+    if (this.ws?.readyState === WebSocket.OPEN) return
 
     this.setStatus('connecting')
 
@@ -189,6 +285,7 @@ export class YjsWebsocketProvider {
 
     this.ws.onopen = () => {
       if (this.destroyed) return
+      this.reconnectAttempts = 0
       this.setStatus('connected')
       this.flushPendingUpdates()
       this.startPingLoop()
@@ -234,7 +331,15 @@ export class YjsWebsocketProvider {
     this.ws.onclose = () => {
       if (this.destroyed) return
       this.stopPingLoop()
-      this.setStatus('disconnected')
+      this.ws = null
+      this.persistPendingUpdates()
+
+      if (this.isBrowserOnline) {
+        this.setStatus('disconnected')
+        this.scheduleReconnect()
+      } else {
+        this.setStatus('offline')
+      }
     }
   }
 
@@ -250,12 +355,19 @@ export class YjsWebsocketProvider {
   destroy() {
     this.destroyed = true
     this.stopPingLoop()
+    this.clearReconnectTimer()
+
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', this.handleBrowserOnline)
+      window.removeEventListener('offline', this.handleBrowserOffline)
+    }
 
     if (this.debounceTimer !== null) {
       clearTimeout(this.debounceTimer)
       this.debounceTimer = null
     }
 
+    this.persistPendingUpdates()
     this.flushPendingUpdates()
 
     this.doc.off('update', this.handleUpdate)

@@ -1,19 +1,26 @@
 import { useEffect, useRef, useState } from 'react'
-import { decodeDocumentState } from '#/lib/document-state'
+import { Bot, WifiOff } from 'lucide-react'
+import { decodeDocumentState, hydrateDocumentDoc } from '#/lib/document-state'
 import { getUserIdFromToken } from '#/lib/auth'
+import {
+  getDemoIntervalMs,
+  insertDemoFragment,
+} from '#/lib/demo/conflict-demo'
+import {
+  clearPendingUpdates,
+  loadDocumentCache,
+  saveDocumentSnapshot,
+} from '#/lib/offline/document-cache'
+import type { ConnectionStatus } from '#/lib/ws/yjs-provider'
 import type { DocumentDetail } from '#/lib/types'
 import { Badge } from '#/components/ui/badge'
+import { Button } from '#/components/ui/button'
 import { Skeleton } from '#/components/ui/skeleton'
 
 type CollaborativeEditorProps = {
   document: DocumentDetail
+  isOfflineFallback?: boolean
 }
-
-type ConnectionStatus =
-  | 'connecting'
-  | 'connected'
-  | 'disconnected'
-  | 'error'
 
 const LIVE_COLORS = [
   'bg-emerald-500',
@@ -24,6 +31,8 @@ const LIVE_COLORS = [
   'bg-cyan-500',
 ]
 
+const SNAPSHOT_DEBOUNCE_MS = 500
+
 function statusVariant(
   status: ConnectionStatus,
 ): 'default' | 'secondary' | 'destructive' | 'outline' {
@@ -31,11 +40,25 @@ function statusVariant(
     case 'connected':
       return 'default'
     case 'connecting':
+    case 'syncing':
       return 'secondary'
     case 'error':
       return 'destructive'
+    case 'offline':
+      return 'outline'
     default:
       return 'outline'
+  }
+}
+
+function statusLabel(status: ConnectionStatus) {
+  switch (status) {
+    case 'offline':
+      return 'offline'
+    case 'syncing':
+      return 'syncing'
+    default:
+      return status
   }
 }
 
@@ -57,7 +80,10 @@ const quillModules = {
  * Quill/Yjs editor — rendered only on the client to avoid SSR issues
  * with react-quill / document access.
  */
-export function CollaborativeEditor({ document }: CollaborativeEditorProps) {
+export function CollaborativeEditor({
+  document,
+  isOfflineFallback = false,
+}: CollaborativeEditorProps) {
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -76,14 +102,67 @@ export function CollaborativeEditor({ document }: CollaborativeEditorProps) {
     )
   }
 
-  return <CollaborativeEditorClient document={document} />
+  return (
+    <CollaborativeEditorClient
+      document={document}
+      isOfflineFallback={isOfflineFallback}
+    />
+  )
 }
 
-function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
+type EditorApi = {
+  yText: { length: number; insert: (index: number, text: string) => void } | null
+}
+
+function CollaborativeEditorClient({
+  document,
+  isOfflineFallback,
+}: CollaborativeEditorProps) {
   const containerRef = useRef<HTMLDivElement>(null)
+  const editorApiRef = useRef<EditorApi>({ yText: null })
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
   const [liveUserIds, setLiveUserIds] = useState<string[]>([])
+  const [demoActive, setDemoActive] = useState(false)
+  const [demoInsertCount, setDemoInsertCount] = useState(0)
   const selfId = getUserIdFromToken()
+
+  const isOffline =
+    status === 'offline' || status === 'disconnected' || isOfflineFallback
+
+  useEffect(() => {
+    setDemoActive(false)
+    setDemoInsertCount(0)
+  }, [document.id])
+
+  useEffect(() => {
+    if (!demoActive) return
+
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+    let cancelled = false
+
+    const scheduleNextInsert = () => {
+      timeoutId = setTimeout(() => {
+        if (cancelled) return
+
+        const yText = editorApiRef.current.yText
+        if (yText) {
+          insertDemoFragment(yText)
+          setDemoInsertCount((count) => count + 1)
+        }
+
+        scheduleNextInsert()
+      }, getDemoIntervalMs())
+    }
+
+    scheduleNextInsert()
+
+    return () => {
+      cancelled = true
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId)
+      }
+    }
+  }, [demoActive])
 
   useEffect(() => {
     let cancelled = false
@@ -113,9 +192,24 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
       const yDoc = new Y.Doc()
       const yText = yDoc.getText('quill')
 
-      const bytes = decodeDocumentState(document.state)
-      if (bytes) {
-        Y.applyUpdate(yDoc, bytes)
+      const serverBytes = decodeDocumentState(document.state)
+      const cached = loadDocumentCache(document.id)
+      const cachedBytes = cached?.state?.length
+        ? Uint8Array.from(cached.state)
+        : null
+      const pendingUpdates =
+        cached?.pendingUpdates.map((data) => Uint8Array.from(data)) ?? []
+
+      const hydrateResult = hydrateDocumentDoc(Y, yDoc, {
+        serverState: serverBytes,
+        cachedState: cachedBytes,
+        cachedUpdatedAt: cached?.localUpdatedAt,
+        serverUpdatedAt: document.updatedAt,
+        pendingUpdates,
+      })
+
+      if (hydrateResult === 'cache') {
+        clearPendingUpdates(document.id)
       }
 
       const quill = new Quill(editorEl, {
@@ -125,6 +219,32 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
       })
 
       const binding = new QuillBinding(yText, quill)
+      editorApiRef.current.yText = yText
+
+      let snapshotTimer: ReturnType<typeof setTimeout> | null = null
+
+      const saveSnapshot = () => {
+        const snapshot = Y.encodeStateAsUpdate(yDoc)
+        saveDocumentSnapshot(document.id, {
+          name: document.name,
+          state: snapshot,
+          serverUpdatedAt: document.updatedAt,
+        })
+      }
+
+      const handleDocUpdate = () => {
+        if (snapshotTimer !== null) {
+          clearTimeout(snapshotTimer)
+        }
+
+        snapshotTimer = setTimeout(() => {
+          snapshotTimer = null
+          saveSnapshot()
+        }, SNAPSHOT_DEBOUNCE_MS)
+      }
+
+      yDoc.on('update', handleDocUpdate)
+
       const provider = new YjsWebsocketProvider({
         doc: yDoc,
         documentId: document.id,
@@ -132,7 +252,15 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
         onPresenceChange: setLiveUserIds,
       })
 
+      saveSnapshot()
+
       cleanup = () => {
+        editorApiRef.current.yText = null
+        if (snapshotTimer !== null) {
+          clearTimeout(snapshotTimer)
+        }
+        saveSnapshot()
+        yDoc.off('update', handleDocUpdate)
         provider.destroy()
         binding.destroy()
         yDoc.destroy()
@@ -145,10 +273,35 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
       cancelled = true
       cleanup?.()
     }
-  }, [document.id, document.state])
+  }, [document.id, document.name, document.state, document.updatedAt])
 
   return (
     <div className="space-y-4">
+      {isOffline ? (
+        <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+          <WifiOff className="size-4 shrink-0" />
+          <span>
+            You&apos;re offline. Changes are saved locally and will sync when
+            you&apos;re back online.
+          </span>
+        </div>
+      ) : null}
+
+      {demoActive ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-violet-500/30 bg-violet-500/10 px-4 py-3 text-sm text-violet-900 dark:text-violet-100">
+          <div className="flex items-center gap-2">
+            <Bot className="size-4 shrink-0" />
+            <span>
+              Conflict demo running — auto-inserting text at random positions.
+              Keep typing to see Yjs merge your edits with the bot.
+            </span>
+          </div>
+          <span className="text-xs text-violet-700 dark:text-violet-200">
+            {demoInsertCount} auto-inserts
+          </span>
+        </div>
+      ) : null}
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">
@@ -158,7 +311,22 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
             Collaborative editor powered by Quill and Yjs
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            type="button"
+            size="sm"
+            variant={demoActive ? 'destructive' : 'outline'}
+            onClick={() => {
+              setDemoActive((active) => {
+                if (active) return false
+                setDemoInsertCount(0)
+                return true
+              })
+            }}
+          >
+            <Bot className="size-4" />
+            {demoActive ? 'Stop conflict demo' : 'Start conflict demo'}
+          </Button>
           <div className="flex items-center gap-2">
             <span className="relative flex size-2">
               <span
@@ -190,7 +358,7 @@ function CollaborativeEditorClient({ document }: CollaborativeEditorProps) {
             </div>
           </div>
           <Badge variant={statusVariant(status)} className="capitalize">
-            {status}
+            {statusLabel(status)}
           </Badge>
         </div>
       </div>
